@@ -11,6 +11,7 @@ import "net/rpc"
 import "net"
 import "bufio"
 import "hash/fnv"
+import "sync"
 
 // import "os/exec"
 
@@ -58,12 +59,12 @@ type MapReduce struct {
 	DoneChannel     chan bool
 	alive           bool
 	l               net.Listener
-	stats           *list.List
+	stats           *list.List // list of done works.
 
 	// Map of registered workers that you need to keep up to date
 	Workers map[string]*WorkerInfo
-
 	// add any additional state here
+	lock sync.RWMutex
 }
 
 func InitMapReduce(nmap int, nreduce int,
@@ -78,6 +79,8 @@ func InitMapReduce(nmap int, nreduce int,
 	mr.DoneChannel = make(chan bool)
 
 	// initialize any additional state here
+	mr.Workers = make(map[string]*WorkerInfo)
+
 	return mr
 }
 
@@ -98,9 +101,19 @@ func (mr *MapReduce) Register(args *RegisterArgs, res *RegisterReply) error {
 
 func (mr *MapReduce) Shutdown(args *ShutdownArgs, res *ShutdownReply) error {
 	DPrintf("Shutdown: registration server\n")
+	mr.lock.Lock()
 	mr.alive = false
+	mr.lock.Unlock()
 	mr.l.Close() // causes the Accept to fail
 	return nil
+}
+
+func (mr *MapReduce) IsAlive() bool {
+	var alive bool
+	mr.lock.RLock()
+	alive = mr.alive
+	mr.lock.RUnlock()
+	return alive
 }
 
 func (mr *MapReduce) StartRegistrationServer() {
@@ -116,7 +129,7 @@ func (mr *MapReduce) StartRegistrationServer() {
 	// now that we are listening on the master address, can fork off
 	// accepting connections to another thread.
 	go func() {
-		for mr.alive {
+		for mr.IsAlive() {
 			conn, err := mr.l.Accept()
 			if err == nil {
 				go func() {

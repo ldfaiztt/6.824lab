@@ -135,14 +135,18 @@ func cleanup(mr *MapReduce) {
 
 func TestBasic(t *testing.T) {
 	fmt.Printf("Test: Basic mapreduce ...\n")
+	// 创建输入文件,起一个mapreduce,
 	mr := setup()
+	// 起两个worker,注册到master,来完成map,reduce的任务.
+	// 过程是把文件拆开,原样存成nMap个文件,在reduce成nReduce个文件.
+	// 最后merge成一个文件,按字符序排序.
 	for i := 0; i < 2; i++ {
 		go RunWorker(mr.MasterAddress, port("worker"+strconv.Itoa(i)),
 			MapFunc, ReduceFunc, -1)
 	}
 	// Wait until MR is done
 	<-mr.DoneChannel
-	check(t, mr.file)
+	check(t, mr.file) // 检测 mr.file的输入是否和输出符合.
 	checkWorker(t, mr.stats)
 	cleanup(mr)
 	fmt.Printf("  ... Basic Passed\n")
