@@ -9,6 +9,14 @@ import "fmt"
 import "os"
 import "sync/atomic"
 
+type State int
+
+const (
+	DEAD State = iota
+	BUSY
+	IDLE
+)
+
 type ViewServer struct {
 	mu       sync.Mutex
 	l        net.Listener
@@ -16,8 +24,99 @@ type ViewServer struct {
 	rpccount int32 // for testing
 	me       string
 
-
 	// Your declarations here.
+	clients      map[string]State // list of clients states.
+	deadCount    map[string]int64 // dead interval count for a client.
+	currentView  View             // current view.
+	previousView View             // previous view.
+	acked        bool             // wether current view is accepted by a server.
+}
+
+func (vs *ViewServer) findIdleServer() string {
+	for name, state := range vs.clients {
+		if state == IDLE {
+			log.Println("find", name)
+			return name
+		}
+	}
+	log.Println("find no name")
+	return ""
+}
+
+var once = true
+
+func (vs *ViewServer) RerangePB() {
+	var view View
+	if vs.currentView.Primary == "" && vs.currentView.Backup == "" {
+		var change bool
+		s := vs.findIdleServer()
+		if s != "" {
+			view.Primary = s
+			vs.clients[s] = BUSY
+			change = true
+		}
+		s = vs.findIdleServer()
+		if s != "" {
+			view.Backup = s
+			vs.clients[s] = BUSY
+			change = true
+		}
+		if change {
+			view.Viewnum = vs.currentView.Viewnum + 1
+
+			vs.previousView = vs.currentView
+			vs.currentView = view
+			if !once {
+				vs.acked = false
+				once = false
+			}
+		}
+	}
+
+	if vs.currentView.Primary == "" && vs.currentView.Backup != "" {
+		view.Primary = vs.currentView.Backup
+		s := vs.findIdleServer()
+		if s != "" {
+			vs.clients[s] = BUSY
+
+			view.Primary = vs.currentView.Backup
+			view.Backup = s
+			view.Viewnum = vs.currentView.Viewnum + 1
+
+			vs.previousView = vs.currentView
+			vs.currentView = view
+		} else {
+			view.Primary = vs.currentView.Backup
+			view.Viewnum = vs.currentView.Viewnum + 1
+
+			vs.previousView = vs.currentView
+			vs.currentView = view
+		}
+		if !once {
+			vs.acked = false
+			once = false
+		}
+	}
+
+	if vs.currentView.Primary != "" && vs.currentView.Backup == "" {
+		view.Primary = vs.currentView.Primary
+		s := vs.findIdleServer()
+		if s != "" {
+			vs.clients[s] = BUSY
+
+			view.Primary = vs.currentView.Primary
+			view.Backup = s
+			view.Viewnum = vs.currentView.Viewnum + 1
+
+			vs.previousView = vs.currentView
+			vs.currentView = view
+			if !once {
+				vs.acked = false
+				once = false
+			}
+		}
+	}
+
 }
 
 //
@@ -26,7 +125,50 @@ type ViewServer struct {
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
 	// Your code here.
-
+	clientName := args.Me
+	// clients connected.
+	log.Println("get ping", args.Me)
+	log.Println("primary", vs.currentView.Primary)
+	log.Println("backup", vs.currentView.Backup)
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	defer func() { vs.deadCount[clientName] = DeadPings }()
+	// clients connected
+	if vs.clients[clientName] != DEAD {
+		vs.deadCount[clientName] = DeadPings
+		// clients connected but restarted.
+		if args.Viewnum == 0 && vs.clients[clientName] != DEAD {
+			log.Println("restart connect")
+			if args.Me == vs.currentView.Primary {
+				vs.currentView.Primary = ""
+			}
+			if args.Me == vs.currentView.Backup {
+				vs.currentView.Backup = ""
+			}
+			vs.RerangePB()
+			reply.View = vs.currentView
+		} else {
+			log.Println("connected connect")
+			if vs.acked {
+				reply.View = vs.currentView
+			} else {
+				// 证明之前的收到了.
+				// 至少保证primary能够同步view.
+				if args.Viewnum == vs.previousView.Viewnum {
+					vs.acked = true
+					reply.View = vs.currentView
+				} else {
+					reply.View = vs.previousView
+				}
+			}
+		}
+	} else {
+		log.Println("new connect")
+		// clients not connected.
+		vs.clients[clientName] = IDLE
+		vs.RerangePB()
+		reply.View = vs.currentView
+	}
 	return nil
 }
 
@@ -36,10 +178,13 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
 	// Your code here.
-
+	if vs.acked {
+		reply.View = vs.currentView
+	} else {
+		reply.View = vs.previousView
+	}
 	return nil
 }
-
 
 //
 // tick() is called once per PingInterval; it should notice
@@ -49,6 +194,25 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 func (vs *ViewServer) tick() {
 
 	// Your code here.
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	for name, count := range vs.deadCount {
+		if count <= 0 && vs.clients[name] != DEAD {
+			// update view if the client is in the view.
+			vs.clients[name] = DEAD
+			log.Println(name + " dead.")
+			if vs.currentView.Primary == name {
+				vs.currentView.Primary = ""
+				vs.RerangePB()
+			}
+			if vs.currentView.Backup == name {
+				vs.currentView.Backup = ""
+				vs.RerangePB()
+			}
+		} else {
+			vs.deadCount[name] = count - 1
+		}
+	}
 }
 
 //
@@ -77,7 +241,9 @@ func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
 	// Your vs.* initializations here.
-
+	vs.acked = true
+	vs.clients = make(map[string]State)
+	vs.deadCount = make(map[string]int64)
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
 	rpcs.Register(vs)
