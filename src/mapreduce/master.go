@@ -47,6 +47,8 @@ func (mr *MapReduce) RunMaster() *list.List {
 					ok := call(worker, "Worker.DoJob", args, &reply)
 					if !ok {
 						fmt.Printf("DoWork: RPC %s do job error\n", worker)
+						jobArgsChan <- args
+						return
 					}
 				}
 			}(worker)
