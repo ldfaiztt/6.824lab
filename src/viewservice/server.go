@@ -27,6 +27,7 @@ type ViewServer struct {
 	// Your declarations here.
 	clients      map[string]State // list of clients states.
 	deadCount    map[string]int64 // dead interval count for a client.
+	lastViewNum  map[string]uint  // last view number for client.
 	currentView  View             // current view.
 	previousView View             // previous view.
 	acked        bool             // wether current view is accepted by a server.
@@ -35,53 +36,58 @@ type ViewServer struct {
 func (vs *ViewServer) findIdleServer() string {
 	for name, state := range vs.clients {
 		if state == IDLE {
-			log.Println("find", name)
+			log.Println("find", name, " marked BUSY.")
+			vs.clients[name] = BUSY
 			return name
 		}
 	}
-	log.Println("find no name")
 	return ""
 }
 
 var once = true
 
-func (vs *ViewServer) RerangePB() {
+func (vs *ViewServer) RerangePB(primary, backup string) {
 	var view View
 	if vs.currentView.Primary == "" && vs.currentView.Backup == "" {
 		var change bool
 		s := vs.findIdleServer()
 		if s != "" {
 			view.Primary = s
-			vs.clients[s] = BUSY
 			change = true
 		}
 		s = vs.findIdleServer()
 		if s != "" {
 			view.Backup = s
-			vs.clients[s] = BUSY
 			change = true
 		}
 		if change {
 			view.Viewnum = vs.currentView.Viewnum + 1
-
+			if primary != "" {
+				vs.currentView.Primary = primary
+			}
+			if backup != "" {
+				vs.currentView.Backup = backup
+			}
 			vs.previousView = vs.currentView
 			vs.currentView = view
 			if !once {
 				vs.acked = false
-				once = false
 			}
+			once = false
 		}
 	}
 
 	if vs.currentView.Primary == "" && vs.currentView.Backup != "" {
-		view.Primary = vs.currentView.Backup
 		s := vs.findIdleServer()
 		if s != "" {
-			vs.clients[s] = BUSY
 
 			view.Primary = vs.currentView.Backup
 			view.Backup = s
 			view.Viewnum = vs.currentView.Viewnum + 1
+
+			if primary != "" {
+				vs.currentView.Primary = primary
+			}
 
 			vs.previousView = vs.currentView
 			vs.currentView = view
@@ -89,13 +95,17 @@ func (vs *ViewServer) RerangePB() {
 			view.Primary = vs.currentView.Backup
 			view.Viewnum = vs.currentView.Viewnum + 1
 
+			if primary != "" {
+				vs.currentView.Primary = primary
+			}
+
 			vs.previousView = vs.currentView
 			vs.currentView = view
 		}
 		if !once {
 			vs.acked = false
-			once = false
 		}
+		once = false
 	}
 
 	if vs.currentView.Primary != "" && vs.currentView.Backup == "" {
@@ -108,12 +118,16 @@ func (vs *ViewServer) RerangePB() {
 			view.Backup = s
 			view.Viewnum = vs.currentView.Viewnum + 1
 
-			vs.previousView = vs.currentView
+			if backup != "" {
+				vs.currentView.Backup = backup
+				vs.previousView = vs.currentView
+			}
+
 			vs.currentView = view
 			if !once {
 				vs.acked = false
-				once = false
 			}
+			once = false
 		}
 	}
 
@@ -127,9 +141,16 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	// Your code here.
 	clientName := args.Me
 	// clients connected.
-	log.Println("get ping", args.Me)
-	log.Println("primary", vs.currentView.Primary)
-	log.Println("backup", vs.currentView.Backup)
+	defer func() {
+		vs.lastViewNum[args.Me] = args.Viewnum
+	}()
+	defer func() {
+		log.Println("_______++_______")
+		log.Println("get ping", args.Me, "view num", args.Viewnum)
+		log.Println("last current view", vs.currentView)
+		log.Println("last previous view", vs.previousView)
+		log.Println("_______--_______")
+	}()
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	defer func() { vs.deadCount[clientName] = DeadPings }()
@@ -137,38 +158,43 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	if vs.clients[clientName] != DEAD {
 		vs.deadCount[clientName] = DeadPings
 		// clients connected but restarted.
-		if args.Viewnum == 0 && vs.clients[clientName] != DEAD {
+		// TODO: 记录ping的列表.
+		if args.Viewnum < vs.lastViewNum[args.Me] && vs.clients[clientName] != DEAD {
 			log.Println("restart connect")
+			var change bool
+			var (
+				primary string
+				backup  string
+			)
 			if args.Me == vs.currentView.Primary {
+				primary = vs.currentView.Primary
 				vs.currentView.Primary = ""
+				vs.clients[args.Me] = IDLE
+				change = true
 			}
 			if args.Me == vs.currentView.Backup {
+				backup = vs.currentView.Backup
 				vs.currentView.Backup = ""
+				vs.clients[args.Me] = IDLE
+				change = true
 			}
-			vs.RerangePB()
-			reply.View = vs.currentView
+			if change {
+				vs.RerangePB(primary, backup)
+			}
 		} else {
-			log.Println("connected connect")
-			if vs.acked {
-				reply.View = vs.currentView
-			} else {
-				// 证明之前的收到了.
-				// 至少保证primary能够同步view.
-				if args.Viewnum == vs.previousView.Viewnum {
-					vs.acked = true
-					reply.View = vs.currentView
-				} else {
-					reply.View = vs.previousView
-				}
+			// 向现在的primary确定,可能backup取代了primary.
+			// 但是之前的primary不应答不会向前提升.
+			if args.Viewnum == vs.previousView.Viewnum && (args.Me == vs.previousView.Primary) {
+				vs.acked = true
 			}
 		}
 	} else {
 		log.Println("new connect")
 		// clients not connected.
 		vs.clients[clientName] = IDLE
-		vs.RerangePB()
-		reply.View = vs.currentView
+		vs.RerangePB(vs.currentView.Primary, vs.currentView.Backup)
 	}
+	reply.View = vs.currentView
 	return nil
 }
 
@@ -183,6 +209,7 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 	} else {
 		reply.View = vs.previousView
 	}
+	log.Println("get view ", reply.View)
 	return nil
 }
 
@@ -202,12 +229,14 @@ func (vs *ViewServer) tick() {
 			vs.clients[name] = DEAD
 			log.Println(name + " dead.")
 			if vs.currentView.Primary == name {
+				var primary = vs.currentView.Primary
 				vs.currentView.Primary = ""
-				vs.RerangePB()
+				vs.RerangePB(primary, "")
 			}
 			if vs.currentView.Backup == name {
+				var backup = vs.currentView.Backup
 				vs.currentView.Backup = ""
-				vs.RerangePB()
+				vs.RerangePB("", backup)
 			}
 		} else {
 			vs.deadCount[name] = count - 1
@@ -244,6 +273,7 @@ func StartServer(me string) *ViewServer {
 	vs.acked = true
 	vs.clients = make(map[string]State)
 	vs.deadCount = make(map[string]int64)
+	vs.lastViewNum = make(map[string]uint)
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
 	rpcs.Register(vs)

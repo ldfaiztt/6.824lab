@@ -9,14 +9,14 @@ import "strconv"
 
 func check(t *testing.T, ck *Clerk, p string, b string, n uint) {
 	view, _ := ck.Get()
+	if n != 0 && n != view.Viewnum {
+		t.Fatalf("wanted viewnum %v, got %v", n, view.Viewnum)
+	}
 	if view.Primary != p {
 		t.Fatalf("wanted primary %v, got %v", p, view.Primary)
 	}
 	if view.Backup != b {
 		t.Fatalf("wanted backup %v, got %v", b, view.Backup)
-	}
-	if n != 0 && n != view.Viewnum {
-		t.Fatalf("wanted viewnum %v, got %v", n, view.Viewnum)
 	}
 	if ck.Primary() != p {
 		t.Fatalf("wanted primary %v, got %v", p, ck.Primary())
@@ -68,8 +68,9 @@ func Test1(t *testing.T) {
 	{
 		vx, _ := ck1.Get()
 		for i := 0; i < DeadPings*2; i++ {
-			ck1.Ping(1)
 			view, _ := ck2.Ping(0)
+			// to ack
+			ck1.Ping(1)
 			if view.Backup == ck2.me {
 				break
 			}
@@ -88,6 +89,10 @@ func Test1(t *testing.T) {
 		for i := 0; i < DeadPings*2; i++ {
 			v, _ := ck2.Ping(vx.Viewnum)
 			if v.Primary == ck2.me && v.Backup == "" {
+				// 之前的ck1不ack就不会提升.
+				ck1.Ping(vx.Viewnum)
+				// ping 表示接收,这里不ping,因为不能让重启的又回来.
+				// ck2.Ping(v.Viewnum)
 				break
 			}
 			time.Sleep(PingInterval)
@@ -103,14 +108,14 @@ func Test1(t *testing.T) {
 		vx, _ := ck2.Get()
 		ck2.Ping(vx.Viewnum)
 		for i := 0; i < DeadPings*2; i++ {
-			ck1.Ping(0)
-			v, _ := ck2.Ping(vx.Viewnum)
+			v, _ := ck1.Ping(0)
+			ck2.Ping(vx.Viewnum + 1)
 			if v.Primary == ck2.me && v.Backup == ck1.me {
 				break
 			}
 			time.Sleep(PingInterval)
 		}
-		check(t, ck2, ck2.me, ck1.me, vx.Viewnum+1)
+		check(t, ck2, ck2.me, ck1.me, vx.Viewnum+2)
 	}
 	fmt.Printf("  ... Passed\n")
 
@@ -129,7 +134,6 @@ func Test1(t *testing.T) {
 			if v.Primary == ck1.me && v.Backup == ck3.me {
 				break
 			}
-			vx = v
 			time.Sleep(PingInterval)
 		}
 		check(t, ck1, ck1.me, ck3.me, vx.Viewnum+1)

@@ -14,3 +14,5 @@
 
 修改:
     在lab1的第二部分:MapReduce的alive变量存在race condition,要加锁.
+    在lab2的first backup test里面,ck1.Ping(1)最好写在ck2.Ping(0)的后面,保证能够让Primary ACK.
+    好像很多地方都不给ACK,要特别注意补上.
